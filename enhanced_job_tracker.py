@@ -566,8 +566,12 @@ class EnhancedJobApplicationTracker:
     
     def should_exclude_message(self, sender_email, subject):
         """Check if message should be excluded from results"""
+        # Safe access to email and subject
+        email_lower = (sender_email or '').lower()
+        subject_lower = (subject or '').lower()
+        
         # Exclude LinkedIn job alerts
-        if 'jobalerts-noreply@linkedin.com' in sender_email.lower():
+        if 'jobalerts-noreply@linkedin.com' in email_lower:
             return True
         
         # Exclude job sites I don't use
@@ -576,9 +580,6 @@ class EnhancedJobApplicationTracker:
             'jobalerts', 'job-alerts', 
             'noreply', 'no-reply'
         ]
-        
-        email_lower = sender_email.lower()
-        subject_lower = subject.lower()
         
         # Check for excluded domains in email
         if any(domain in email_lower for domain in excluded_domains):
@@ -669,7 +670,10 @@ class EnhancedJobApplicationTracker:
         """Process a message and extract job application data"""
         try:
             # Check if this message should be excluded
-            if self.should_exclude_message(message_content['sender_email'], message_content['subject']):
+            sender_email = message_content.get('sender_email', '')
+            subject = message_content.get('subject', '')
+            
+            if self.should_exclude_message(sender_email, subject):
                 return None
             
             # Parse date
@@ -682,33 +686,33 @@ class EnhancedJobApplicationTracker:
             
             # Extract company info
             company_name = self.extract_company_from_email(
-                message_content['sender_email'], 
-                message_content['body']
+                message_content.get('sender_email', ''), 
+                message_content.get('body', '')
             )
             
             # Extract position
             position = self.extract_position_from_content(
-                message_content['subject'],
-                message_content['body']
+                message_content.get('subject', ''),
+                message_content.get('body', '')
             )
             
             # Extract HR contact
             hr_contact = self.extract_hr_contact(
-                message_content['sender'], 
-                message_content['sender_email']
+                message_content.get('sender', ''), 
+                message_content.get('sender_email', '')
             )
             
             # Extract physical address
-            physical_address = self.extract_physical_address(message_content['body'])
+            physical_address = self.extract_physical_address(message_content.get('body', ''))
             
             # Check if it's a rejection
             is_rejection = self.is_rejection_email(
-                message_content['subject'], 
-                message_content['body']
+                message_content.get('subject', ''), 
+                message_content.get('body', '')
             )
             
             # Determine if this is an outbound application or company response
-            subject_lower = message_content['subject'].lower()
+            subject_lower = message_content.get('subject', '').lower()
             is_outbound = any(keyword in subject_lower for keyword in [
                 'application', 'applying', 'interested in', 'resume'
             ])
@@ -716,8 +720,8 @@ class EnhancedJobApplicationTracker:
             # Check if I corresponded with this company/person
             corresponded = self.check_if_corresponded(
                 self.services[account_email],
-                message_content['sender_email'],
-                message_content['subject'],
+                message_content.get('sender_email', ''),
+                message_content.get('subject', ''),
                 account_email
             )
             
@@ -729,8 +733,8 @@ class EnhancedJobApplicationTracker:
             
             # Check for application confirmation
             has_confirmation = self.is_application_confirmation(
-                message_content['subject'], 
-                message_content['body']
+                message_content.get('subject', ''), 
+                message_content.get('body', '')
             )
             
             # Calculate priority score for ranking
@@ -746,14 +750,15 @@ class EnhancedJobApplicationTracker:
                 'company_name': company_name,
                 'position': position,
                 'hr_contact': hr_contact,
-                'company_email': message_content['sender_email'],
-                'subject': message_content['subject'],
+                'company_email': message_content.get('sender_email', ''),
+                'subject': message_content.get('subject', ''),
+                'body': message_content.get('body', ''),  # Ensure body is included
                 'is_rejection': is_rejection,
                 'is_outbound': is_outbound,
                 'corresponded': corresponded,
                 'physical_address': physical_address,
                 'account': account_email,
-                'message_id': message_content['message_id'],
+                'message_id': message_content.get('message_id', ''),
                 'pdf_match': pdf_match,
                 'priority_score': priority_score,
                 'pdf_link': pdf_match['path'] if pdf_match else '',
@@ -960,7 +965,53 @@ class EnhancedJobApplicationTracker:
         # Merge information from other applications if needed
         merged_app = self.merge_application_data(best_app, applications)
         
-        return merged_app
+        return merged
+    
+    def organize_by_week(self, applications):
+        """Organize applications by week and rank by priority"""
+        weekly_data = defaultdict(list)
+        
+        # Start from March 27, 2025
+        start_date = datetime(2025, 3, 27)
+        
+        for app in applications:
+            # Calculate week
+            days_diff = (app['date'] - start_date).days
+            week_num = days_diff // 7
+            week_start = start_date + timedelta(weeks=week_num)
+            week_key = week_start.strftime("Week of %m/%d/%Y")
+            
+            weekly_data[week_key].append(app)
+        
+        # Sort applications within each week by priority score (highest first)
+        for week in weekly_data:
+            weekly_data[week].sort(key=lambda x: x['priority_score'], reverse=True)
+        
+        return dict(weekly_data)
+    
+    def filter_outbound_applications(self, applications):
+        """Filter to only outbound applications for NC unemployment report, sorted by priority"""
+        outbound_apps = []
+        
+        for app in applications:
+            # Check if this is an outbound application
+            if app.get('is_outbound', False):
+                outbound_apps.append(app)
+            # Also include applications where we corresponded (likely outbound)
+            elif app.get('corresponded', False):
+                outbound_apps.append(app)
+            # Include applications with specific subjects that indicate we applied
+            elif any(keyword in app.get('subject', '').lower() for keyword in [
+                'thank you for applying', 'application received', 'we have received your application'
+            ]):
+                outbound_apps.append(app)
+            # Include if we have a matching PDF resume
+            elif app.get('pdf_match'):
+                outbound_apps.append(app)
+        
+        # Sort by priority score (rejections and PDF matches first)
+        outbound_apps.sort(key=lambda x: x['priority_score'], reverse=True)
+        return outbound_apps
     
     def merge_application_data(self, best_app, all_apps):
         """Merge useful data from duplicate applications"""
@@ -977,10 +1028,14 @@ class EnhancedJobApplicationTracker:
         latest_date = best_app['date']
         
         for app in all_apps:
-            all_subjects.add(app['subject'])
-            if app['company_email']:
+            # Safely get values with defaults
+            subject = app.get('subject', '')
+            body = app.get('body', '')
+            
+            all_subjects.add(subject)
+            if app.get('company_email'):
                 all_emails.add(app['company_email'])
-            if app['physical_address']:
+            if app.get('physical_address'):
                 all_addresses.add(app['physical_address'])
             
             if app.get('is_rejection'):
@@ -1001,8 +1056,8 @@ class EnhancedJobApplicationTracker:
                 if app.get('pdf_date'):
                     merged['pdf_date'] = app['pdf_date']
             
-            # Check for application confirmation
-            if self.is_application_confirmation(app['subject'], app['body']):
+            # Check for application confirmation with safe access
+            if self.is_application_confirmation(subject, body):
                 has_confirmation = True
         
         # Update merged application with combined information
@@ -1026,16 +1081,17 @@ class EnhancedJobApplicationTracker:
             merged['physical_address'] = max(all_addresses, key=len)
         
         # Update notes to reflect merged information
-        notes = f"Subject: {merged['subject'][:50]}..."
+        subject = merged.get('subject', '')
+        notes = f"Subject: {subject[:50]}..." if subject else "No subject"
         if len(all_apps) > 1:
             notes += f" [Merged from {len(all_apps)} emails]"
-        if merged['is_outbound']:
+        if merged.get('is_outbound'):
             notes += " [Outbound Application]"
         if merged.get('pdf_match'):
             notes += " [PDF Resume Found]"
         if has_confirmation:
             notes += " [Application Confirmed]"
-        if merged['is_rejection']:
+        if merged.get('is_rejection'):
             notes += " [REJECTION EMAIL]"
         
         merged['notes'] = notes
