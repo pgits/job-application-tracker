@@ -936,7 +936,10 @@ class EnhancedJobApplicationTracker:
             if app.get('pdf_match'):
                 # Check if any email in the group confirms application
                 has_confirmation = any(
-                    self.is_application_confirmation(other_app['subject'], other_app['body'])
+                    self.is_application_confirmation(
+                        other_app.get('subject', ''), 
+                        other_app.get('body', '')
+                    )
                     for other_app in applications
                 )
                 
@@ -965,7 +968,7 @@ class EnhancedJobApplicationTracker:
         # Merge information from other applications if needed
         merged_app = self.merge_application_data(best_app, applications)
         
-        return merged
+        return merged_app
     
     def organize_by_week(self, applications):
         """Organize applications by week and rank by priority"""
