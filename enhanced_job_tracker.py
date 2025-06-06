@@ -172,6 +172,9 @@ class EnhancedJobApplicationTracker:
             r'(?:application[_\s]*)?([a-zA-Z]+)[_\s]*(?:\d{4}|\d{1,2}[-_]\d{1,2})'
         ]
         
+        # Excluded companies to ignore
+        excluded_companies = ['ziprecruiter', 'ihire', 'indeed', 'monster', 'careerbuilder']
+        
         # Job title patterns in filenames
         job_patterns = [
             r'(software[_\s]*engineer|senior[_\s]*engineer|full[_\s]*stack|frontend|backend|developer)',
@@ -190,8 +193,11 @@ class EnhancedJobApplicationTracker:
         for pattern in company_patterns:
             match = re.search(pattern, filename_lower)
             if match:
-                company_name = match.group(1).capitalize()
-                break
+                potential_company = match.group(1).capitalize()
+                # Skip excluded companies
+                if potential_company.lower() not in excluded_companies:
+                    company_name = potential_company
+                    break
         
         # Try to extract job title
         for pattern in job_patterns:
@@ -209,11 +215,15 @@ class EnhancedJobApplicationTracker:
                     known_companies = [
                         'Microsoft', 'Google', 'Amazon', 'Meta', 'Apple',
                         'Facebook', 'Netflix', 'Spotify', 'Uber', 'Airbnb',
-                        'LinkedIn', 'Twitter', 'Tesla', 'NVIDIA', 'Intel'
+                        'LinkedIn', 'Twitter', 'Tesla', 'NVIDIA', 'Intel',
+                        'Salesforce', 'Oracle', 'IBM', 'Adobe', 'Cisco'
                     ]
                     
+                    # Exclude job sites
+                    excluded_sites = ['ZipRecruiter', 'iHire', 'Indeed', 'Monster', 'CareerBuilder']
+                    
                     for company in known_companies:
-                        if company.lower() in text.lower():
+                        if company.lower() in text.lower() and company not in excluded_sites:
                             company_name = company
                             break
                 
@@ -308,6 +318,11 @@ class EnhancedJobApplicationTracker:
             'linkedin': 'LinkedIn',
             'glassdoor': 'Glassdoor'
         }
+        
+        # Skip companies I don't use
+        excluded_companies = ['ziprecruiter', 'ihire', 'indeed']
+        if company_name.lower() in excluded_companies:
+            return "LinkedIn"
         
         return company_mappings.get(company_name.lower(), company_name)
     
@@ -555,25 +570,34 @@ class EnhancedJobApplicationTracker:
         if 'jobalerts-noreply@linkedin.com' in sender_email.lower():
             return True
         
-        # Exclude other automated job alerts that aren't actual applications
-        exclude_patterns = [
-            'jobalerts',
-            'job-alerts', 
-            'noreply',
-            'no-reply'
+        # Exclude job sites I don't use
+        excluded_domains = [
+            'ziprecruiter', 'ihire', 'indeed',
+            'jobalerts', 'job-alerts', 
+            'noreply', 'no-reply'
         ]
         
         email_lower = sender_email.lower()
         subject_lower = subject.lower()
         
-        # Only exclude if it's clearly an automated alert
-        if any(pattern in email_lower for pattern in exclude_patterns):
+        # Check for excluded domains in email
+        if any(domain in email_lower for domain in excluded_domains):
             # But keep if it seems like a real application response
             if not any(keyword in subject_lower for keyword in [
                 'thank you for applying', 'application received', 
                 'interview', 'unfortunately', 'not selected'
             ]):
                 return True
+        
+        # Also exclude based on subject line
+        excluded_subject_patterns = [
+            'ziprecruiter', 'ihire', 'indeed',
+            'job alert', 'job recommendation', 'new jobs',
+            'jobs matching your search'
+        ]
+        
+        if any(pattern in subject_lower for pattern in excluded_subject_patterns):
+            return True
         
         return False
     
@@ -703,10 +727,19 @@ class EnhancedJobApplicationTracker:
                 'date': msg_date
             }, self.pdf_resumes)
             
-            # Calculate priority score for ranking
-            priority_score = self.calculate_priority_score(
-                is_rejection, is_outbound, corresponded, pdf_match
+            # Check for application confirmation
+            has_confirmation = self.is_application_confirmation(
+                message_content['subject'], 
+                message_content['body']
             )
+            
+            # Calculate priority score for ranking
+            priority_score = self.calculate_enhanced_priority_score({
+                'is_rejection': is_rejection,
+                'is_outbound': is_outbound,
+                'corresponded': corresponded,
+                'pdf_match': pdf_match
+            }, has_confirmation)
             
             return {
                 'date': msg_date,
@@ -725,7 +758,8 @@ class EnhancedJobApplicationTracker:
                 'priority_score': priority_score,
                 'pdf_link': pdf_match['path'] if pdf_match else '',
                 'pdf_job_title': pdf_match['job_title'] if pdf_match else '',
-                'pdf_date': pdf_match['modified_date'] if pdf_match else None
+                'pdf_date': pdf_match['modified_date'] if pdf_match else None,
+                'has_confirmation': has_confirmation
             }
             
         except Exception as e:
@@ -782,7 +816,262 @@ class EnhancedJobApplicationTracker:
         except:
             return datetime.now()
     
-    def organize_by_week(self, applications):
+    def normalize_company_name(self, company_name):
+        """Normalize company name for duplicate detection"""
+        if not company_name:
+            return ""
+        
+        # Convert to lowercase and remove common variations
+        normalized = company_name.lower().strip()
+        
+        # Remove common company suffixes
+        suffixes = [' inc', ' inc.', ' corp', ' corp.', ' llc', ' ltd', ' ltd.', 
+                   ' company', ' co', ' co.', ' corporation', ' limited']
+        for suffix in suffixes:
+            if normalized.endswith(suffix):
+                normalized = normalized[:-len(suffix)].strip()
+        
+        # Handle common variations
+        company_variations = {
+            'meta': 'facebook',
+            'alphabet': 'google',
+            'x': 'twitter'
+        }
+        
+        return company_variations.get(normalized, normalized)
+    
+    def normalize_position_title(self, position):
+        """Keep position titles as-is for duplicate detection"""
+        if not position or position == "Not Specified":
+            return "general"
+        
+        # Just clean up whitespace and convert to lowercase
+        normalized = position.lower().strip()
+        normalized = re.sub(r'\s+', ' ', normalized)
+        
+        return normalized
+    
+    def create_application_key(self, app):
+        """Create a unique key for application deduplication"""
+        company = self.normalize_company_name(app['company_name'])
+        position = self.normalize_position_title(app.get('pdf_job_title') or app['position'])
+        
+        return f"{company}::{position}"
+    
+    def is_application_confirmation(self, subject, body):
+        """Check if email confirms that an application was submitted"""
+        confirmation_keywords = [
+            'thank you for applying', 'application received', 'we have received your application',
+            'your application has been', 'application submitted', 'application confirmation',
+            'thank you for your interest', 'we received your resume', 'application complete',
+            'thank you for submitting', 'successfully submitted', 'application acknowledgment'
+        ]
+        
+        text_to_check = (subject + " " + body).lower()
+        
+        for keyword in confirmation_keywords:
+            if keyword in text_to_check:
+                return True
+        
+        return False
+    
+    def deduplicate_applications(self, applications):
+        """Remove duplicate applications, keeping the best one for each company+position"""
+        print("🔄 Deduplicating applications...")
+        
+        # Group applications by company + position
+        application_groups = {}
+        
+        for app in applications:
+            key = self.create_application_key(app)
+            
+            if key not in application_groups:
+                application_groups[key] = []
+            application_groups[key].append(app)
+        
+        # Select the best application from each group
+        deduplicated = []
+        duplicates_removed = 0
+        
+        for key, group in application_groups.items():
+            if len(group) == 1:
+                # No duplicates, keep the single application
+                deduplicated.append(group[0])
+            else:
+                # Multiple applications for same company+position, pick the best one
+                best_app = self.select_best_application(group)
+                deduplicated.append(best_app)
+                duplicates_removed += len(group) - 1
+                
+                company = group[0]['company_name']
+                position = group[0].get('pdf_job_title') or group[0]['position']
+                print(f"  🔄 Merged {len(group)} applications for {company} - {position}")
+        
+        print(f"✅ Removed {duplicates_removed} duplicates, kept {len(deduplicated)} unique applications")
+        return deduplicated
+    
+    def select_best_application(self, applications):
+        """Select the best application from a group of duplicates"""
+        # Priority order for selecting the best application:
+        # 1. Has rejection email (highest priority - 1000 points)
+        # 2. Has PDF match with confirmation (highest priority - 1000 points)
+        # 3. Has PDF match without confirmation (high priority - 500 points)
+        # 4. Is outbound application (100 points)
+        # 5. Has correspondence (50 points)
+        # 6. Most recent date (bonus)
+        
+        def app_score(app):
+            score = 0
+            
+            # Rejection emails are most important
+            if app.get('is_rejection'):
+                score += 1000
+            
+            # PDF matches with application confirmation are equally important
+            if app.get('pdf_match'):
+                # Check if any email in the group confirms application
+                has_confirmation = any(
+                    self.is_application_confirmation(other_app['subject'], other_app['body'])
+                    for other_app in applications
+                )
+                
+                if has_confirmation:
+                    score += 1000  # Same as rejection
+                else:
+                    score += 500   # High but not highest
+            
+            # Outbound applications are important
+            if app.get('is_outbound'):
+                score += 100
+            
+            # Correspondence is somewhat important
+            if app.get('corresponded'):
+                score += 50
+            
+            # More recent applications get slight preference
+            days_since_start = (app['date'] - datetime(2025, 3, 27)).days
+            score += days_since_start * 0.1
+            
+            return score
+        
+        # Sort by score and return the best one
+        best_app = max(applications, key=app_score)
+        
+        # Merge information from other applications if needed
+        merged_app = self.merge_application_data(best_app, applications)
+        
+        return merged_app
+    
+    def merge_application_data(self, best_app, all_apps):
+        """Merge useful data from duplicate applications"""
+        merged = best_app.copy()
+        
+        # Collect all unique information
+        all_subjects = set()
+        all_emails = set()
+        all_addresses = set()
+        has_rejection = False
+        has_correspondence = False
+        has_pdf = False
+        has_confirmation = False
+        latest_date = best_app['date']
+        
+        for app in all_apps:
+            all_subjects.add(app['subject'])
+            if app['company_email']:
+                all_emails.add(app['company_email'])
+            if app['physical_address']:
+                all_addresses.add(app['physical_address'])
+            
+            if app.get('is_rejection'):
+                has_rejection = True
+                if app['date'] > latest_date:
+                    latest_date = app['date']
+            
+            if app.get('corresponded'):
+                has_correspondence = True
+            
+            if app.get('pdf_match'):
+                has_pdf = True
+                # Use PDF job title if available
+                if app.get('pdf_job_title'):
+                    merged['pdf_job_title'] = app['pdf_job_title']
+                if app.get('pdf_link'):
+                    merged['pdf_link'] = app['pdf_link']
+                if app.get('pdf_date'):
+                    merged['pdf_date'] = app['pdf_date']
+            
+            # Check for application confirmation
+            if self.is_application_confirmation(app['subject'], app['body']):
+                has_confirmation = True
+        
+        # Update merged application with combined information
+        merged['is_rejection'] = has_rejection
+        merged['corresponded'] = has_correspondence
+        merged['pdf_match'] = has_pdf
+        merged['has_confirmation'] = has_confirmation
+        
+        # Use the most comprehensive email if available
+        if all_emails:
+            # Prefer non-noreply emails
+            preferred_emails = [email for email in all_emails if 'noreply' not in email.lower()]
+            if preferred_emails:
+                merged['company_email'] = list(preferred_emails)[0]
+            else:
+                merged['company_email'] = list(all_emails)[0]
+        
+        # Use the most detailed address
+        if all_addresses:
+            # Prefer longer addresses (more detailed)
+            merged['physical_address'] = max(all_addresses, key=len)
+        
+        # Update notes to reflect merged information
+        notes = f"Subject: {merged['subject'][:50]}..."
+        if len(all_apps) > 1:
+            notes += f" [Merged from {len(all_apps)} emails]"
+        if merged['is_outbound']:
+            notes += " [Outbound Application]"
+        if merged.get('pdf_match'):
+            notes += " [PDF Resume Found]"
+        if has_confirmation:
+            notes += " [Application Confirmed]"
+        if merged['is_rejection']:
+            notes += " [REJECTION EMAIL]"
+        
+        merged['notes'] = notes
+        
+        # Recalculate priority score with new logic
+        merged['priority_score'] = self.calculate_enhanced_priority_score(merged, has_confirmation)
+        
+        return merged
+    
+    def calculate_enhanced_priority_score(self, app, has_confirmation=False):
+        """Calculate enhanced priority score for ranking applications"""
+        score = 0
+        
+        # Highest priority: Actual rejections
+        if app.get('is_rejection'):
+            score += 1000
+        
+        # Equally high priority: PDF matches with application confirmation
+        if app.get('pdf_match') and has_confirmation:
+            score += 1000
+        elif app.get('pdf_match'):
+            score += 500
+        
+        # Medium priority: Outbound applications
+        if app.get('is_outbound'):
+            score += 100
+        
+        # Lower priority: Had correspondence
+        if app.get('corresponded'):
+            score += 50
+        
+        # Bonus for application confirmation
+        if has_confirmation:
+            score += 25
+        
+        return score
         """Organize applications by week and rank by priority"""
         weekly_data = defaultdict(list)
         
@@ -859,19 +1148,13 @@ class EnhancedJobApplicationTracker:
                     rejection_date = app['date'].strftime('%m/%d/%Y') if app['is_rejection'] else ""
                     
                     # Create enhanced notes
-                    notes = f"Subject: {app['subject'][:50]}..."
-                    if app['is_outbound']:
-                        notes += " [Outbound Application]"
-                    if app['pdf_match']:
-                        notes += " [PDF Resume Found]"
-                    if app['is_rejection']:
-                        notes += " [REJECTION EMAIL]"
+                    notes = app.get('notes', f"Subject: {app['subject'][:50]}...")
                     
                     writer.writerow({
                         'Week': week,
                         'Priority_Score': app['priority_score'],
                         'Company_Name': app['company_name'],
-                        'Position': app['pdf_job_title'] if app['pdf_job_title'] else app['position'],
+                        'Position': app['pdf_job_title'] if app.get('pdf_job_title') else app['position'],
                         'HR_Contact': app['hr_contact'],
                         'Company_Email': app['company_email'],
                         'Application_Date': app['date'].strftime('%m/%d/%Y'),
@@ -880,9 +1163,9 @@ class EnhancedJobApplicationTracker:
                         'Rejection_Date': rejection_date,
                         'Notes': notes,
                         'Physical_Address': app['physical_address'],
-                        'PDF_Resume_Link': app['pdf_link'],
-                        'PDF_Job_Title': app['pdf_job_title'],
-                        'PDF_Date': app['pdf_date'].strftime('%m/%d/%Y') if app['pdf_date'] else ''
+                        'PDF_Resume_Link': app.get('pdf_link', ''),
+                        'PDF_Job_Title': app.get('pdf_job_title', ''),
+                        'PDF_Date': app['pdf_date'].strftime('%m/%d/%Y') if app.get('pdf_date') else ''
                     })
         
         print(f"📄 Main CSV report generated: {filename}")
@@ -1145,6 +1428,8 @@ class EnhancedJobApplicationTracker:
         print(f"PDF Resume Matches: {pdf_matches}")
         print(f"Actual Rejections: {rejections}")
         print(f"Response Rate: {(rejections/total_apps*100):.1f}%" if total_apps > 0 else "N/A")
+        print(f"📝 Note: Excluded ZipRecruiter, iHire, and Indeed from all results")
+        print(f"🔄 Note: Duplicates merged by company + exact position title")
         
         # Priority breakdown
         high_priority = len([app for app in applications if app['priority_score'] >= 100])
@@ -1181,11 +1466,21 @@ class EnhancedJobApplicationTracker:
             print(f"\n📄 PDF RESUME MATCHES:")
             for app in sorted(pdf_apps, key=lambda x: x['date'], reverse=True)[:5]:
                 print(f"  • {app['company_name']} - {app['pdf_job_title']} ({app['pdf_date'].strftime('%m/%d/%Y')})")
+        
+        # Show what was excluded
+        excluded_count = 0
+        for week, apps in weekly_data.items():
+            for app in apps:
+                if any(excluded in app['company_name'].lower() for excluded in ['ziprecruiter', 'ihire', 'indeed']):
+                    excluded_count += 1
+        
+        if excluded_count > 0:
+            print(f"\n🚫 Excluded {excluded_count} applications from ZipRecruiter, iHire, and Indeed")
     
     def run_tracker(self):
         """Run the enhanced job application tracker"""
-        print("🚀 Starting Enhanced Job Application Tracker with Priority Ranking")
-        print("=" * 70)
+        print("🚀 Starting Enhanced Job Application Tracker with Priority Ranking & Deduplication")
+        print("=" * 80)
         
         # Scan Downloads for PDF resumes first
         self.pdf_resumes = self.scan_downloads_for_resumes()
@@ -1208,8 +1503,13 @@ class EnhancedJobApplicationTracker:
         
         print(f"\n📊 Total applications found: {len(all_applications)}")
         
+        # Remove duplicates
+        unique_applications = self.deduplicate_applications(all_applications)
+        
+        print(f"📊 Unique applications after deduplication: {len(unique_applications)}")
+        
         # Organize by week (with priority ranking)
-        self.weekly_data = self.organize_by_week(all_applications)
+        self.weekly_data = self.organize_by_week(unique_applications)
         
         # Generate enhanced reports
         main_csv = self.generate_csv_report(self.weekly_data)
@@ -1217,14 +1517,14 @@ class EnhancedJobApplicationTracker:
         nc_pdf = self.generate_nc_unemployment_pdf(self.weekly_data)
         
         # Show enhanced summary
-        self.show_summary(all_applications, self.weekly_data)
+        self.show_summary(unique_applications, self.weekly_data)
         
         print(f"\n🎉 All enhanced reports generated successfully!")
         print(f"📁 Files created:")
-        print(f"   📄 Complete report (prioritized): {main_csv}")
-        print(f"   📄 NC unemployment CSV (prioritized): {nc_csv}")
+        print(f"   📄 Complete report (prioritized & deduplicated): {main_csv}")
+        print(f"   📄 NC unemployment CSV (prioritized & deduplicated): {nc_csv}")
         if nc_pdf:
-            print(f"   📄 NC unemployment PDF (prioritized): {nc_pdf}")
+            print(f"   📄 NC unemployment PDF (prioritized & deduplicated): {nc_pdf}")
         else:
             print("   ⚠️  NC unemployment PDF: Not created (see messages above)")
         
