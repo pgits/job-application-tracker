@@ -111,7 +111,6 @@ class EnhancedJobApplicationTracker:
         
         company_indicators = [
             'microsoft', 'google', 'amazon', 'meta', 'apple',
-            'linkedin', 'indeed', 'glassdoor', 'facebook',
             'linkedin', 'glassdoor', 'facebook',
             'netflix', 'spotify', 'uber', 'airbnb',
             'engineer', 'developer', 'software', 'programmer'
